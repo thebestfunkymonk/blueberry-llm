@@ -18,6 +18,7 @@ from typing import List, Optional, Tuple
 import warnings
 import os
 import pickle
+import json
 from torchtune.modules import RotaryPositionalEmbeddings
 warnings.filterwarnings('ignore')
 
@@ -53,6 +54,10 @@ class MoEModelConfig:
     # Evaluation
     eval_every: int = 500
     eval_steps: int = 100
+    top_k_list: Tuple[int, ...] = (1, 5)
+    ece_num_bins: int = 15
+    token_loss_hist_bins: int = 30
+    metrics_dir: str = "metrics"
 
     # Regularization
     weight_decay: float = 0.1
@@ -486,14 +491,163 @@ class MoEMinimalLLM(nn.Module):
             return logits, total_aux_loss
         return logits
 
-def evaluate_model(model: nn.Module, val_loader: DataLoader, config: MoEModelConfig):
-    """Evaluate model performance"""
-    model.eval()
-    total_loss = 0
-    total_tokens = 0
-    total_correct = 0
+def _init_eval_accumulators(config: MoEModelConfig):
+    """Create accumulators for streaming eval metrics."""
+    top_k_list = list(getattr(config, 'top_k_list', (1, 5)))
+    ece_bins = getattr(config, 'ece_num_bins', 15)
+    token_hist_bins = getattr(config, 'token_loss_hist_bins', 30)
 
+    return {
+        'total_loss_sum': 0.0,
+        'total_token_count': 0,
+        'topk_correct_counts': {int(k): 0 for k in top_k_list},
+        'total_correct_top1': 0,
+        'entropy_sum': 0.0,
+        'repetition_equal_count': 0,   # count of positions where pred_t == pred_{t-1}
+        'repetition_total_positions': 0,
+        'ece_bin_edges': torch.linspace(0.0, 1.0, steps=ece_bins + 1).cpu(),
+        'ece_bin_counts': torch.zeros(ece_bins, dtype=torch.long).cpu(),
+        'ece_conf_sums': torch.zeros(ece_bins, dtype=torch.double).cpu(),
+        'ece_correct_sums': torch.zeros(ece_bins, dtype=torch.long).cpu(),
+        'loss_hist_edges': torch.linspace(0.0, 10.0, steps=token_hist_bins + 1).cpu(),
+        'loss_hist_counts': torch.zeros(token_hist_bins, dtype=torch.long).cpu(),
+    }
+
+def _accumulate_batch_metrics(
+    accumulators: dict,
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    top_k_list: List[int],
+    use_amp: bool
+) -> None:
+    """Accumulate metrics for a single batch. logits, targets shapes [B, T, V] and [B, T]."""
+    batch_size, seq_len, vocab_size = logits.shape
+    device = logits.device
+
+    # Cross-entropy per-token
+    per_token_loss = F.cross_entropy(
+        logits.view(-1, vocab_size), targets.view(-1), reduction='none'
+    )  # [B*T]
+    accumulators['total_loss_sum'] += float(per_token_loss.sum().detach().cpu())
+    accumulators['total_token_count'] += int(per_token_loss.numel())
+
+    # Token-wise loss histogram (streaming)
+    # Bucketize on CPU to keep memory in check
+    loss_cpu = per_token_loss.detach().cpu()
+    bin_idx = torch.bucketize(loss_cpu, accumulators['loss_hist_edges'], right=False) - 1
+    bin_idx = bin_idx.clamp(min=0, max=accumulators['loss_hist_counts'].numel() - 1)
+    accumulators['loss_hist_counts'] += torch.bincount(
+        bin_idx, minlength=accumulators['loss_hist_counts'].numel()
+    )
+
+    # Predictions and correctness
+    preds = logits.argmax(dim=-1)  # [B, T]
+    correct_top1 = (preds == targets).sum().item()
+    accumulators['total_correct_top1'] += int(correct_top1)
+
+    # Top-k accuracy
+    flat_targets = targets.view(-1)
+    for k in top_k_list:
+        k_safe = int(min(int(k), vocab_size))
+        if k_safe <= 0:
+            continue
+        topk = torch.topk(logits.view(-1, vocab_size), k_safe, dim=-1).indices  # [B*T, k]
+        in_topk = (topk == flat_targets.unsqueeze(-1)).any(dim=-1)
+        accumulators['topk_correct_counts'][int(k)] += int(in_topk.sum().item())
+
+    # Predictive entropy
+    # Use log-sum-exp trick via log_softmax to improve stability
+    log_probs = F.log_softmax(logits, dim=-1)
+    probs = log_probs.exp()
+    entropy = -(probs * log_probs).sum(dim=-1)  # [B, T]
+    accumulators['entropy_sum'] += float(entropy.sum().detach().cpu())
+
+    # ECE accumulators based on predicted confidence and correctness
+    pred_conf, pred_class = probs.max(dim=-1)  # [B, T]
+    correct = (pred_class == targets).detach().cpu().view(-1)
+    conf = pred_conf.detach().cpu().view(-1)
+    ece_edges = accumulators['ece_bin_edges']
+    ece_bins = ece_edges.numel() - 1
+    conf_bin_idx = torch.bucketize(conf, ece_edges, right=True) - 1
+    conf_bin_idx = conf_bin_idx.clamp(min=0, max=ece_bins - 1)
+
+    # Aggregate per bin
+    accumulators['ece_bin_counts'] += torch.bincount(conf_bin_idx, minlength=ece_bins)
+    accumulators['ece_conf_sums'] += torch.bincount(
+        conf_bin_idx, weights=conf.to(torch.double), minlength=ece_bins
+    )
+    accumulators['ece_correct_sums'] += torch.bincount(
+        conf_bin_idx, weights=correct.to(torch.long), minlength=ece_bins
+    )
+
+    # Repetition rate across predictions within each sequence
+    if seq_len > 1:
+        repeats = (preds[:, 1:] == preds[:, :-1]).sum().item()
+        accumulators['repetition_equal_count'] += int(repeats)
+        accumulators['repetition_total_positions'] += int(batch_size * (seq_len - 1))
+
+def _finalize_eval_metrics(accumulators: dict, config: MoEModelConfig) -> dict:
+    """Compute final metrics from accumulators."""
+    total_tokens = max(1, accumulators['total_token_count'])
+    avg_loss = accumulators['total_loss_sum'] / total_tokens
+    perplexity = math.exp(min(avg_loss, 20))
+    accuracy_top1 = accumulators['total_correct_top1'] / total_tokens
+
+    # Top-k accuracies
+    topk_acc = {
+        f'top{k}': accumulators['topk_correct_counts'][k] / total_tokens
+        for k in sorted(accumulators['topk_correct_counts'].keys())
+    }
+
+    # Mean predictive entropy
+    mean_entropy = accumulators['entropy_sum'] / total_tokens
+
+    # ECE computation
+    bin_counts = accumulators['ece_bin_counts'].to(torch.double)
+    nonzero = bin_counts > 0
+    avg_conf = torch.zeros_like(bin_counts)
+    avg_acc = torch.zeros_like(bin_counts)
+    avg_conf[nonzero] = (accumulators['ece_conf_sums'][nonzero] / bin_counts[nonzero])
+    avg_acc[nonzero] = (accumulators['ece_correct_sums'][nonzero].to(torch.double) / bin_counts[nonzero])
+    weights = bin_counts / max(1.0, float(bin_counts.sum().item()))
+    ece = float((weights * (avg_acc - avg_conf).abs()).sum().item())
+
+    # Repetition rate
+    if accumulators['repetition_total_positions'] > 0:
+        repetition_rate = accumulators['repetition_equal_count'] / accumulators['repetition_total_positions']
+    else:
+        repetition_rate = 0.0
+
+    # Token-wise loss histogram
+    loss_hist = {
+        'bin_edges': accumulators['loss_hist_edges'].tolist(),
+        'counts': accumulators['loss_hist_counts'].tolist()
+    }
+
+    metrics = {
+        'val_loss': avg_loss,
+        'val_accuracy': accuracy_top1,
+        'val_perplexity': perplexity,
+        'topk_accuracy': topk_acc,
+        'predictive_entropy': mean_entropy,
+        'ece': ece,
+        'repetition_rate': repetition_rate,
+        'token_loss_histogram': loss_hist,
+    }
+    return metrics
+
+def evaluate_model(
+    model: nn.Module,
+    val_loader: DataLoader,
+    config: MoEModelConfig,
+    save_path: Optional[str] = None
+):
+    """Evaluate model performance with extended metrics and optional JSON save."""
+    model.eval()
     device = next(model.parameters()).device
+
+    accum = _init_eval_accumulators(config)
+    top_k_list = list(getattr(config, 'top_k_list', (1, 5)))
 
     with torch.no_grad():
         for i, (x, y) in enumerate(val_loader):
@@ -502,22 +656,126 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: MoEModelCon
             x, y = x.to(device), y.to(device)
 
             with autocast(enabled=config.use_amp):
-                # MoE model evaluation
-                logits = model(x, return_aux_loss=False)  # Don't return aux loss during eval
-                loss = F.cross_entropy(logits.view(-1, config.vocab_size), y.view(-1))
+                logits = model(x, return_aux_loss=False)
 
-            total_loss += loss.item() * y.numel()
-            total_tokens += y.numel()
+            _accumulate_batch_metrics(accum, logits, y, top_k_list, config.use_amp)
 
-            predictions = logits.argmax(dim=-1)
-            total_correct += (predictions == y).sum().item()
+    metrics = _finalize_eval_metrics(accum, config)
 
-    avg_loss = total_loss / total_tokens
-    accuracy = total_correct / total_tokens
-    perplexity = math.exp(min(avg_loss, 20))
+    # Optional save
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, 'w') as f:
+            json.dump(metrics, f, indent=2)
 
     model.train()
-    return {'val_loss': avg_loss, 'val_accuracy': accuracy, 'val_perplexity': perplexity}
+    return metrics
+
+def _evaluate_on_texts(
+    model: nn.Module,
+    tokenizer,
+    texts: List[str],
+    config: MoEModelConfig
+) -> dict:
+    """Teacher-forced evaluation on raw texts for sanity checks."""
+    device = next(model.parameters()).device
+    accum = _init_eval_accumulators(config)
+    top_k_list = list(getattr(config, 'top_k_list', (1, 5)))
+
+    model.eval()
+    with torch.no_grad():
+        for text in texts:
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            if len(ids) < 2:
+                continue
+            # Create single batch sequence [1, T-1] input and targets
+            x = torch.tensor(ids[:-1], dtype=torch.long, device=device).unsqueeze(0)
+            y = torch.tensor(ids[1:], dtype=torch.long, device=device).unsqueeze(0)
+
+            with autocast(enabled=config.use_amp):
+                logits = model(x, return_aux_loss=False)
+
+            _accumulate_batch_metrics(accum, logits, y, top_k_list, config.use_amp)
+
+    metrics = _finalize_eval_metrics(accum, config)
+    model.train()
+    return metrics
+
+def _sample_generate(
+    model: nn.Module,
+    tokenizer,
+    device: torch.device,
+    prompt: str,
+    max_length: int = 50,
+    temperature: float = 0.8,
+    top_k: int = 50
+) -> str:
+    """Simple sampler for sanity check generations."""
+    model.eval()
+    input_ids = torch.tensor(tokenizer.encode(prompt, return_tensors=None, add_special_tokens=False), dtype=torch.long, device=device).unsqueeze(0)
+    generated = input_ids.clone()
+    with torch.no_grad():
+        for _ in range(max_length):
+            logits = model(generated, return_aux_loss=False)
+            next_logits = logits[0, -1] / max(1e-6, temperature)
+            if top_k > 0:
+                topk_vals, topk_idx = torch.topk(next_logits, k=min(top_k, next_logits.size(-1)))
+                mask = next_logits < topk_vals[-1]
+                next_logits = next_logits.masked_fill(mask, float('-inf'))
+            probs = F.softmax(next_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            generated = torch.cat([generated, next_token.view(1, 1)], dim=1)
+    text = tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
+    # Return only the newly generated part
+    return text[len(prompt):]
+
+def run_sanity_checks(
+    model: nn.Module,
+    tokenizer,
+    config: MoEModelConfig,
+    out_dir: str
+) -> dict:
+    """Run simple sanity checks on classic prompts and save results."""
+    os.makedirs(out_dir, exist_ok=True)
+    classic_texts = [
+        "the quick brown fox jumps over the lazy dog",
+        "to be or not to be, that is the question",
+        "hello world!",
+        "once upon a time there was a",
+        "1 1 2 3 5 8 13 21"
+    ]
+    # Teacher-forced evaluation on these texts (aggregated)
+    agg_metrics = _evaluate_on_texts(model, tokenizer, classic_texts, config)
+
+    # Per-text metrics
+    per_text = {}
+    for t in classic_texts:
+        per_text[t] = _evaluate_on_texts(model, tokenizer, [t], config)
+
+    # Generations for quick qualitative check
+    device = next(model.parameters()).device
+    gen_prompts = [
+        "The quick brown fox",
+        "To be or not to be",
+        "Hello world",
+        "Once upon a time",
+        "In a galaxy far, far away"
+    ]
+    generations = []
+    for p in gen_prompts:
+        gen = _sample_generate(model, tokenizer, device, p, max_length=40, temperature=0.8, top_k=50)
+        generations.append({'prompt': p, 'generated': gen})
+
+    sanity = {
+        'aggregated_metrics': agg_metrics,
+        'per_text_metrics': per_text,
+        'generations': generations
+    }
+
+    with open(os.path.join(out_dir, 'sanity_checks.json'), 'w') as f:
+        json.dump(sanity, f, indent=2)
+
+    return sanity
 
 def setup_muon_optimizer(model: nn.Module, config: MoEModelConfig):
     """Setup Muon optimizer with hybrid approach"""
@@ -542,7 +800,12 @@ def setup_muon_optimizer(model: nn.Module, config: MoEModelConfig):
     return [muon_optimizer, adamw_optimizer]
 
 
-def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader: DataLoader):
+def train_moe_model(
+    config: MoEModelConfig,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    tokenizer=None
+):
     """Train the MoE model"""
     print(f"\n🚀 Training MoE model with {config.num_experts} experts (top-{config.expert_top_k})")
 
@@ -581,6 +844,10 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
         schedulers.append(scheduler)
 
     scaler = GradScaler() if config.use_amp else None
+
+    # Prepare metrics directory
+    metrics_dir = getattr(config, 'metrics_dir', 'metrics')
+    os.makedirs(metrics_dir, exist_ok=True)
 
     # Training loop
     model.train()
@@ -656,15 +923,20 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
 
             # Evaluation
             if step % config.eval_every == 0 and step > 0:
-                eval_metrics = evaluate_model(model, val_loader, config)
+                eval_path = os.path.join(metrics_dir, f"eval_step_{step}.json")
+                eval_metrics = evaluate_model(model, val_loader, config, save_path=eval_path)
+                topk_str = ", ".join([f"top{k}:{eval_metrics['topk_accuracy'].get(f'top{k}', 0):.3f}" for k in getattr(config, 'top_k_list', (1, 5))])
                 print(f"\nStep {step}: Val Loss: {eval_metrics['val_loss']:.4f}, "
-                      f"Val Acc: {eval_metrics['val_accuracy']:.4f}, "
-                      f"Val PPL: {eval_metrics['val_perplexity']:.2f}")
+                      f"Val Acc@1: {eval_metrics['val_accuracy']:.4f}, "
+                      f"{topk_str}, PPL: {eval_metrics['val_perplexity']:.2f}, "
+                      f"ECE: {eval_metrics['ece']:.4f}, Entropy: {eval_metrics['predictive_entropy']:.3f}, "
+                      f"Repeat: {eval_metrics['repetition_rate']:.3f}")
 
             # Milestone evaluations
             if step in getattr(config, 'log_milestones', ()):    
-                eval_metrics = evaluate_model(model, val_loader, config)
-                print(f"\n🧪 Milestone {step}: Val Loss: {eval_metrics['val_loss']:.4f}")
+                milestone_path = os.path.join(metrics_dir, f"milestone_{step}.json")
+                eval_metrics = evaluate_model(model, val_loader, config, save_path=milestone_path)
+                print(f"\n🧪 Milestone {step}: Val Loss: {eval_metrics['val_loss']:.4f}, ECE: {eval_metrics['ece']:.4f}")
 
             step += 1
             if step % 20 == 0:
@@ -673,13 +945,24 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
     pbar.close()
 
     # Final evaluation
-    final_eval = evaluate_model(model, val_loader, config)
+    final_eval_path = os.path.join(metrics_dir, 'final_eval.json')
+    final_eval = evaluate_model(model, val_loader, config, save_path=final_eval_path)
     print(f"\n📊 Final Results:")
     print(f"   Val Loss: {final_eval['val_loss']:.4f}")
-    print(f"   Val Accuracy: {final_eval['val_accuracy']:.4f}")
+    print(f"   Val Accuracy@1: {final_eval['val_accuracy']:.4f}")
     print(f"   Val Perplexity: {final_eval['val_perplexity']:.2f}")
+    print(f"   ECE: {final_eval['ece']:.4f}, Entropy: {final_eval['predictive_entropy']:.3f}, Repeat: {final_eval['repetition_rate']:.3f}")
 
-    return model, final_eval
+    sanity_metrics = None
+    if tokenizer is not None:
+        try:
+            sanity_dir = os.path.join(metrics_dir, 'sanity')
+            sanity_metrics = run_sanity_checks(model, tokenizer, config, sanity_dir)
+            print("\n🧪 Wrote sanity check metrics and generations to metrics/sanity/sanity_checks.json")
+        except Exception as e:
+            print(f"⚠️  Sanity checks failed: {e}")
+
+    return model, final_eval, sanity_metrics
 
 if __name__ == "__main__":
     # Check system
@@ -726,7 +1009,7 @@ if __name__ == "__main__":
 
     # Train model
     start_time = time.time()
-    model, final_metrics = train_moe_model(config, train_loader, val_loader)
+    model, final_metrics, _ = train_moe_model(config, train_loader, val_loader, tokenizer=tokenizer)
     total_time = time.time() - start_time
 
     print(f"\n🎯 MoE Model Results:")

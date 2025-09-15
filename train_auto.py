@@ -124,7 +124,7 @@ def main():
     
     # Train the model
     print("\n🚀 Starting training...")
-    model, final_metrics = train_moe_model(model_config, train_loader, val_loader)
+    model, final_metrics, _ = train_moe_model(model_config, train_loader, val_loader, tokenizer=tokenizer)
     
     # Save results
     print("\n💾 Saving model...")
