@@ -242,7 +242,8 @@ def main():
             train_loader=train_loader,
             val_loader=val_loader,
             config=config,
-            device=device
+            device=device,
+            tokenizer=tokenizer
         )
         
         training_time = time.time() - start_time
@@ -255,6 +256,22 @@ def main():
         print(f"   Validation Loss: {final_metrics['val_loss']:.4f}")
         print(f"   Validation Accuracy: {final_metrics['val_accuracy']:.4f}")
         print(f"   Validation Perplexity: {final_metrics['val_perplexity']:.2f}")
+        # Print extended metrics if present
+        for k in ['top1_accuracy', 'top5_accuracy', 'repetition_rate', 'predictive_entropy', 'ece']:
+            if k in final_metrics:
+                print(f"   {k.replace('_', ' ').title()}: {final_metrics[k]:.4f}")
+        # Print that sanity check exists
+        if 'sanity_check' in final_metrics:
+            overall = final_metrics['sanity_check']['overall']
+            print("   Sanity Check (Overall):")
+            print(f"     Avg Loss: {overall['avg_loss']:.4f}, PPL: {overall['perplexity']:.2f}, Acc: {overall['accuracy']:.4f}")
+            # Per-prompt quick summary
+            per_prompt = final_metrics['sanity_check'].get('per_prompt', [])
+            for item in per_prompt[:3]:
+                # Print a compact one-liner per prompt
+                gen = item.get('generated', '')
+                gen_preview = (gen[:80] + '…') if len(gen) > 80 else gen
+                print(f"     Prompt: '{item['prompt'][:40] + ('…' if len(item['prompt'])>40 else '')}' | acc={item['top1_accuracy']:.3f} | avg_nll={item['avg_nll']:.3f} | gen='{gen_preview}'")
         
         if 'mfu' in final_metrics:
             print(f"   Model FLOPs Utilization: {final_metrics['mfu']*100:.1f}%")

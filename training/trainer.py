@@ -17,7 +17,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 from configs import AdaptiveMoEModelConfig
 from optimizers import setup_optimizers, get_lr_scheduler
-from .evaluation import evaluate_model, compute_model_metrics
+from .evaluation import evaluate_model, compute_model_metrics, evaluate_sanity_check
 from system import print_system_info
 
 
@@ -27,7 +27,8 @@ def train_model(
     val_loader: DataLoader,
     config: AdaptiveMoEModelConfig,
     device: Optional[torch.device] = None,
-    resume_from_checkpoint: Optional[str] = None
+    resume_from_checkpoint: Optional[str] = None,
+    tokenizer: Optional[Any] = None
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
     Main training function for adaptive LLM models.
@@ -82,7 +83,7 @@ def train_model(
     )
     
     # Main training loop
-    final_metrics = _training_loop(training_state, train_loader, val_loader)
+    final_metrics = _training_loop(training_state, train_loader, val_loader, tokenizer)
     
     print(f"\n🎯 Training completed!")
     print(f"📊 Final metrics: {final_metrics}")
@@ -117,7 +118,8 @@ class TrainingState:
 def _training_loop(
     state: TrainingState,
     train_loader: DataLoader,
-    val_loader: DataLoader
+    val_loader: DataLoader,
+    tokenizer: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Main training loop.
@@ -186,6 +188,11 @@ def _training_loop(
     
     # Final evaluation
     final_metrics = _evaluate_and_log(state, val_loader, final=True)
+
+    # Optional sanity check on classic prompts
+    if tokenizer is not None:
+        sanity = evaluate_sanity_check(state.model, tokenizer, state.config)
+        final_metrics['sanity_check'] = sanity
     
     # Add training summary
     training_time = time.time() - state.training_start_time
@@ -416,6 +423,10 @@ def _evaluate_and_log(
     print(f"   Val Loss: {eval_metrics['val_loss']:.4f}")
     print(f"   Val Accuracy: {eval_metrics['val_accuracy']:.4f}")
     print(f"   Val Perplexity: {eval_metrics['val_perplexity']:.2f}")
+    # Extended metrics if present
+    for k in ['top1_accuracy', 'top5_accuracy', 'repetition_rate', 'predictive_entropy', 'ece']:
+        if k in eval_metrics:
+            print(f"   {k.replace('_', ' ').title()}: {eval_metrics[k]:.4f}")
     
     if final:
         print(f"   Training Time: {elapsed_time/60:.1f} minutes")

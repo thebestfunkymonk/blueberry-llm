@@ -39,6 +39,9 @@ class AdaptiveMoEModelConfig:
     # Evaluation
     eval_every: int = 500
     eval_steps: int = 100
+    eval_top_k: Tuple[int, ...] = (1, 5)
+    ece_num_bins: int = 15
+    loss_hist_num_bins: int = 30
 
     # Regularization
     weight_decay: float = 0.1
