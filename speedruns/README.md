@@ -6,6 +6,7 @@
 - **Time**: 5 minutes
 - **Hardware**: Tesla T4 (16GB VRAM)
 - **Metric**: Validation loss (lower = better)
+- **data**: training and validation data must stay the same
 
 ## How to Compete
 1. Copy template: `cp -r speedrun/submissions/template-change-this speedrun/submissions/your-username`
